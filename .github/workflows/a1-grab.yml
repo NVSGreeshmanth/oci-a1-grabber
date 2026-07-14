@@ -14,7 +14,7 @@ on:
 
 concurrency:
   group: a1-grab
-  cancel-in-progress: false      # let a running hunt finish; don't stack
+  cancel-in-progress: true       # only ONE hunt at a time (avoids OCI 429 throttling)
 
 jobs:
   grab:
@@ -70,10 +70,14 @@ jobs:
               echo "A1 LAUNCHED ip=$IP"
               exit 0
             fi
-            if ! grep -qi 'capacity' /tmp/e; then
-              echo "Non-capacity error — stopping:"; cat /tmp/e; exit 1
+            if grep -qiE 'capacity' /tmp/e; then
+              echo "$(date -u '+%H:%M:%S') attempt $i — out of A1 capacity, retry in 60s"
+              sleep 60; continue
             fi
-            echo "$(date -u '+%H:%M:%S') attempt $i — out of A1 capacity, retry in 60s"
-            sleep 60
+            if grep -qiE 'too *many *requests|toomanyrequests|"status": *429' /tmp/e; then
+              echo "$(date -u '+%H:%M:%S') attempt $i — throttled (429), backing off 180s"
+              sleep 180; continue
+            fi
+            echo "Non-capacity, non-throttle error — stopping:"; cat /tmp/e; exit 1
           done
           echo "Run window ended without capacity; the next scheduled run resumes the hunt."
