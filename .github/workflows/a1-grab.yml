@@ -1,24 +1,25 @@
 name: A1 capacity grabber
 
-# Retries an Always-Free Ampere A1 launch every 5 min until Sydney has capacity,
-# then no-ops once TripPlanner-A1 is running. Put this in a DEDICATED PUBLIC repo
-# so Actions minutes are unlimited (private repos share a 2000/mo pool with the
-# GTFS-DB build). Secrets stay encrypted in repo settings — safe in a public repo.
+# Hunts an Always-Free Ampere A1 launch until Sydney has capacity, then no-ops once
+# TripPlanner-A1 is running. GitHub's */5 cron is unreliable (it skips/deprioritises
+# high-frequency schedules), so instead ONE run LOOPS INTERNALLY — retrying every 60s
+# for ~5 h — and a low-frequency cron just restarts the loop. Put this in a DEDICATED
+# PUBLIC repo so Actions minutes are unlimited. Secrets stay encrypted (safe in public).
 # Disable the workflow (Actions tab) once A1 is landed.
 
 on:
   schedule:
-    - cron: '*/5 * * * *'      # every 5 minutes (public repo = unlimited minutes)
-  workflow_dispatch: {}          # also run manually from the Actions tab
+    - cron: '7 */6 * * *'        # every 6 h — just restarts the internal loop
+  workflow_dispatch: {}          # run manually from the Actions tab to start hunting now
 
 concurrency:
   group: a1-grab
-  cancel-in-progress: false
+  cancel-in-progress: false      # let a running hunt finish; don't stack
 
 jobs:
   grab:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 340         # ~5.6 h; the loop below stops itself before this
     env:
       OCI_CLI_USER:        ${{ secrets.OCI_CLI_USER }}
       OCI_CLI_TENANCY:     ${{ secrets.OCI_CLI_TENANCY }}
@@ -32,7 +33,7 @@ jobs:
       - name: Install OCI CLI
         run: pip install --quiet oci-cli
 
-      - name: Try to launch A1 (skips if one already exists)
+      - name: Hunt for A1 capacity (retry every 60s for ~5h)
         run: |
           set -uo pipefail
           COMP=$(oci iam availability-domain list --query 'data[0]."compartment-id"' --raw-output)
@@ -50,24 +51,29 @@ jobs:
           SUBNET=$(oci network subnet list -c "$COMP" \
             --query "data[?contains(\"display-name\",'public')].id | [0]" --raw-output)
           printf '%s\n' "$SSH_PUBKEY" > /tmp/id.pub
+          echo "comp=$COMP ad=$AD image=$IMAGE subnet=$SUBNET"
 
-          if oci compute instance launch \
-                --availability-domain "$AD" -c "$COMP" \
-                --shape VM.Standard.A1.Flex \
-                --shape-config "{\"ocpus\":$OCPUS,\"memoryInGBs\":$MEMGB}" \
-                --image-id "$IMAGE" --subnet-id "$SUBNET" \
-                --assign-public-ip true --ssh-authorized-keys-file /tmp/id.pub \
-                --display-name TripPlanner-A1 --wait-for-state RUNNING 2>/tmp/e; then
-            IID=$(oci compute instance list -c "$COMP" --display-name TripPlanner-A1 \
-              --lifecycle-state RUNNING --query 'data[0].id' --raw-output)
-            IP=$(oci compute instance list-vnics --instance-id "$IID" \
-              --query 'data[0]."public-ip"' --raw-output)
-            echo "## 🎉 A1 launched" >> "$GITHUB_STEP_SUMMARY"
-            echo "Public IP: \`$IP\`" >> "$GITHUB_STEP_SUMMARY"
-            echo "A1 LAUNCHED ip=$IP"
-          else
-            if grep -qi 'capacity' /tmp/e; then
-              echo "Still out of A1 capacity — will retry next run."; exit 0
+          for i in $(seq 1 320); do
+            if oci compute instance launch \
+                  --availability-domain "$AD" -c "$COMP" \
+                  --shape VM.Standard.A1.Flex \
+                  --shape-config "{\"ocpus\":$OCPUS,\"memoryInGBs\":$MEMGB}" \
+                  --image-id "$IMAGE" --subnet-id "$SUBNET" \
+                  --assign-public-ip true --ssh-authorized-keys-file /tmp/id.pub \
+                  --display-name TripPlanner-A1 --wait-for-state RUNNING 2>/tmp/e; then
+              IID=$(oci compute instance list -c "$COMP" --display-name TripPlanner-A1 \
+                --lifecycle-state RUNNING --query 'data[0].id' --raw-output)
+              IP=$(oci compute instance list-vnics --instance-id "$IID" \
+                --query 'data[0]."public-ip"' --raw-output)
+              echo "## 🎉 A1 launched" >> "$GITHUB_STEP_SUMMARY"
+              echo "Public IP: \`$IP\`" >> "$GITHUB_STEP_SUMMARY"
+              echo "A1 LAUNCHED ip=$IP"
+              exit 0
             fi
-            echo "Non-capacity error:"; cat /tmp/e; exit 1
-          fi
+            if ! grep -qi 'capacity' /tmp/e; then
+              echo "Non-capacity error — stopping:"; cat /tmp/e; exit 1
+            fi
+            echo "$(date -u '+%H:%M:%S') attempt $i — out of A1 capacity, retry in 60s"
+            sleep 60
+          done
+          echo "Run window ended without capacity; the next scheduled run resumes the hunt."
